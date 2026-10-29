@@ -52,7 +52,7 @@ impl IndexingPerformance {
         indexer: IndexerId,
         deployment: DeploymentId,
         success: bool,
-        latency_ms: u16,
+        latency_ms: u32,
         latest_block: Option<BlockNumber>,
     ) {
         self.msgs
@@ -60,7 +60,8 @@ impl IndexingPerformance {
                 indexer,
                 deployment,
                 success,
-                latency_ms,
+                // The selection library accepts u16 milliseconds. Never wrap slow requests.
+                latency_ms: u16::try_from(latency_ms).unwrap_or(u16::MAX),
                 latest_block,
             })
             .unwrap();
@@ -139,6 +140,33 @@ impl Actor {
                     snapshot.latest_block = Some(*latest_block);
                 };
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod latency_tests {
+    use super::*;
+
+    #[test]
+    fn selection_feedback_saturates_instead_of_wrapping_slow_requests() {
+        let data = Box::leak(Box::new(DoubleBuffer::default()));
+        let (msgs, mut rx) = mpsc::unbounded_channel();
+        let performance = IndexingPerformance { data, msgs };
+        for (milliseconds, expected) in [
+            (250, 250),
+            (65_535, 65_535),
+            (65_536, 65_535),
+            (70_000, 65_535),
+        ] {
+            performance.feedback(
+                thegraph_core::alloy::primitives::Address::ZERO.into(),
+                [0; 32].into(),
+                false,
+                milliseconds,
+                None,
+            );
+            assert_eq!(rx.try_recv().unwrap().latency_ms, expected);
         }
     }
 }

@@ -319,7 +319,7 @@ async fn run_indexer_queries(
                         .query_indexer(deployment_url, auth, &indexer_query)
                         .in_current_span()
                         .await;
-                    let response_time_ms = start_time.elapsed().as_millis() as u16;
+                    let response_time_ms = reports::response_time_ms(start_time.elapsed());
                     let report = reports::IndexerRequest {
                         indexer,
                         deployment,
@@ -434,7 +434,7 @@ async fn run_indexer_queries(
         tracing::trace!(indexer_request = indexer_request.request);
     }
 
-    let response_time_ms = client_response_time.as_millis() as u16;
+    let response_time_ms = reports::response_time_ms(client_response_time);
     let ideal_response_time_ms = indexer_requests
         .iter()
         .filter(|i| i.result.is_ok())
@@ -714,7 +714,7 @@ pub async fn handle_indexer_query(
         .query_indexer(deployment_url, indexer_auth, &payload)
         .in_current_span()
         .await;
-    let response_time_ms = start_time.elapsed().as_millis() as u16;
+    let response_time_ms = reports::response_time_ms(start_time.elapsed());
     let indexer_request = reports::IndexerRequest {
         indexer: indexing_id.indexer,
         deployment: indexing_id.deployment,
@@ -722,7 +722,7 @@ pub async fn handle_indexer_query(
         receipt,
         subgraph_chain: subgraph.chain,
         result: result.clone(),
-        response_time_ms: indexer_start_time.elapsed().as_millis() as u16,
+        response_time_ms: reports::response_time_ms(indexer_start_time.elapsed()),
         seconds_behind,
         blocks_behind,
         request: payload,

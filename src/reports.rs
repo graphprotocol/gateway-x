@@ -8,9 +8,14 @@ use tokio::{sync::mpsc, time::Instant};
 
 use crate::{concat_bytes, errors, indexer_client::IndexerResponse, receipts::Receipt};
 
+/// Milliseconds for the protobuf uint32 fields, saturating only at the wire type's limit.
+pub fn response_time_ms(duration: Duration) -> u32 {
+    u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
+}
+
 pub struct ClientRequest {
     pub id: String,
-    pub response_time_ms: u16,
+    pub response_time_ms: u32,
     pub result: Result<(), errors::Error>,
     pub api_key: String,
     pub user: String,
@@ -28,7 +33,7 @@ pub struct IndexerRequest {
     pub receipt: Receipt,
     pub subgraph_chain: String,
     pub result: Result<IndexerResponse, errors::IndexerError>,
-    pub response_time_ms: u16,
+    pub response_time_ms: u32,
     pub seconds_behind: u32,
     pub blocks_behind: u64, // TODO: rm
     pub request: String,
@@ -115,7 +120,7 @@ impl Reporter {
                 indexed_chain: indexer_request.subgraph_chain.clone(),
                 url: indexer_request.url.clone(),
                 fee_grt: indexer_request.receipt.value() as f64 * 1e-18,
-                response_time_ms: indexer_request.response_time_ms as u32,
+                response_time_ms: indexer_request.response_time_ms,
                 seconds_behind: indexer_request.seconds_behind,
                 result: indexer_request
                     .result
@@ -155,7 +160,7 @@ impl Reporter {
                 .result
                 .map(|()| "success".to_string())
                 .unwrap_or_else(|err| err.to_string()),
-            response_time_ms: client_request.response_time_ms as u32,
+            response_time_ms: client_request.response_time_ms,
             request_bytes: client_request.request_bytes,
             response_bytes: client_request.response_bytes,
             total_fees_usd,
@@ -298,4 +303,39 @@ pub struct AttestationProtobuf {
     /// 65 bytes, ECDSA signature (v, r, s)
     #[prost(bytes, tag = "7")]
     signature: Vec<u8>,
+}
+
+#[cfg(test)]
+mod long_duration_tests {
+    use super::*;
+
+    #[test]
+    fn milliseconds_preserve_long_requests_and_saturate_at_wire_limit() {
+        for milliseconds in [
+            0,
+            65_535,
+            65_536,
+            70_000,
+            u64::from(u32::MAX),
+            u64::from(u32::MAX) + 1,
+        ] {
+            let actual = response_time_ms(Duration::from_millis(milliseconds));
+            assert_eq!(u64::from(actual), milliseconds.min(u64::from(u32::MAX)));
+        }
+    }
+
+    #[test]
+    fn protobuf_round_trip_preserves_long_client_and_indexer_durations() {
+        let message = ClientQueryProtobuf {
+            response_time_ms: response_time_ms(Duration::from_secs(70)),
+            indexer_queries: vec![IndexerQueryProtobuf {
+                response_time_ms: response_time_ms(Duration::from_secs(66)),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let decoded = ClientQueryProtobuf::decode(message.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.response_time_ms, 70_000);
+        assert_eq!(decoded.indexer_queries[0].response_time_ms, 66_000);
+    }
 }
