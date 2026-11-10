@@ -189,7 +189,7 @@ fn response_errors(response: &str) -> Result<Vec<Error>, IndexerError> {
 
     // Avoid processing oversized errors.
     for err in &mut payload.errors {
-        err.message.truncate(256);
+        err.message.truncate(err.message.floor_char_boundary(256));
         err.message.shrink_to_fit();
     }
 
@@ -268,6 +268,31 @@ mod tests {
         ];
         for (input, expected) in tests {
             assert_eq!(super::check_block_error(input), expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod error_truncation_tests {
+    use super::response_errors;
+
+    #[test]
+    fn unicode_errors_are_truncated_without_splitting_characters() {
+        for (message, expected) in [
+            (format!("{}é", "a".repeat(255)), "a".repeat(255)),
+            (format!("{}€", "a".repeat(254)), "a".repeat(254)),
+            (format!("{}🦀", "a".repeat(253)), "a".repeat(253)),
+            (
+                format!("{}é!", "a".repeat(254)),
+                format!("{}é", "a".repeat(254)),
+            ),
+            ("a".repeat(300), "a".repeat(256)),
+            ("short 🦀".into(), "short 🦀".into()),
+        ] {
+            let response = serde_json::json!({"errors": [{"message": message}]}).to_string();
+            let errors = response_errors(&response).unwrap();
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors[0].message, expected);
         }
     }
 }
