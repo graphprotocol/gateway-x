@@ -165,11 +165,9 @@ impl Reporter {
         client_query_msg.encode(&mut self.write_buf).unwrap();
         let record: rdkafka::producer::BaseRecord<(), [u8], ()> =
             rdkafka::producer::BaseRecord::to(&self.topics.queries).payload(&self.write_buf);
-        self.kafka_producer
-            .send(record)
-            .map_err(|(err, _)| err)
-            .context(anyhow!("failed to send to topic {}", self.topics.queries))?;
+        let sent = self.kafka_producer.send(record).map_err(|(err, _)| err);
         self.write_buf.clear();
+        sent.context(anyhow!("failed to send to topic {}", self.topics.queries))?;
 
         let now = Instant::now();
         for indexer_request in client_request.indexer_requests {
@@ -204,14 +202,12 @@ impl Reporter {
                 let record: rdkafka::producer::BaseRecord<(), [u8], ()> =
                     rdkafka::producer::BaseRecord::to(&self.topics.attestations)
                         .payload(&self.write_buf);
-                self.kafka_producer
-                    .send(record)
-                    .map_err(|(err, _)| err)
-                    .context(anyhow!(
-                        "failed to send to topic {}",
-                        self.topics.attestations
-                    ))?;
+                let sent = self.kafka_producer.send(record).map_err(|(err, _)| err);
                 self.write_buf.clear();
+                sent.context(anyhow!(
+                    "failed to send to topic {}",
+                    self.topics.attestations
+                ))?;
             }
         }
 
@@ -298,4 +294,126 @@ pub struct AttestationProtobuf {
     /// 65 bytes, ECDSA signature (v, r, s)
     #[prost(bytes, tag = "7")]
     signature: Vec<u8>,
+}
+
+#[cfg(test)]
+mod buffer_tests {
+    use rdkafka::producer::Producer;
+    use thegraph_core::{alloy::signers::local::PrivateKeySigner, attestation};
+
+    use super::*;
+    use crate::receipts::ReceiptSigner;
+
+    fn reporter(queries: &str, attestations: &str) -> Reporter {
+        Reporter {
+            tap_signer: Address::ZERO,
+            graph_env: "test".into(),
+            topics: Topics {
+                queries: queries.into(),
+                attestations: attestations.into(),
+            },
+            write_buf: Vec::new(),
+            kafka_producer: rdkafka::ClientConfig::new()
+                .set("message.timeout.ms", "60000")
+                .set("queue.buffering.max.messages", "1")
+                .create()
+                .unwrap(),
+            attestation_sampler: AttestationSampler::new(),
+        }
+    }
+
+    fn request() -> ClientRequest {
+        ClientRequest {
+            id: "test-query".into(),
+            response_time_ms: 250,
+            result: Ok(()),
+            api_key: String::new(),
+            user: String::new(),
+            subgraph: None,
+            grt_per_usd: NotNan::new(1.0).unwrap(),
+            indexer_requests: Vec::new(),
+            request_bytes: 0,
+            response_bytes: None,
+        }
+    }
+
+    #[test]
+    fn query_enqueue_failure_leaves_buffer_ready_for_next_report() {
+        let mut reporter = reporter("queries", "attestations");
+        reporter.report(request()).unwrap();
+        let error = reporter.report(request()).unwrap_err();
+        assert!(error.to_string().starts_with("failed to send to topic"));
+        reporter
+            .kafka_producer
+            .purge(rdkafka::producer::PurgeConfig::default().queue());
+        reporter
+            .kafka_producer
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        assert!(reporter.write_buf.is_empty());
+        reporter.report(request()).unwrap();
+        assert!(reporter.write_buf.is_empty());
+        reporter
+            .kafka_producer
+            .purge(rdkafka::producer::PurgeConfig::default().queue());
+    }
+
+    #[test]
+    fn attestation_enqueue_failure_leaves_buffer_ready_for_next_report() {
+        let mut reporter = reporter("queries", "attestations");
+        let mut request = request();
+        // Ephemeral test signers never leave this process.
+        let signer = PrivateKeySigner::random();
+        let receipt_signer = ReceiptSigner::new(
+            Address::ZERO,
+            PrivateKeySigner::random(),
+            1.try_into().unwrap(),
+            Address::ZERO,
+            Address::ZERO,
+        );
+        let deployment = [0; 32].into();
+        let query = r#"{"query":"{ test }"}"#;
+        let response_body = r#"{"data":{"test":true}}"#;
+        let attestation = attestation::create(
+            &attestation::eip712_domain(1, Address::ZERO),
+            &signer,
+            &deployment,
+            query,
+            response_body,
+        );
+        request.indexer_requests.push(IndexerRequest {
+            indexer: Address::ZERO.into(),
+            deployment,
+            url: "https://example.invalid".into(),
+            receipt: receipt_signer
+                .create_receipt(signer.address().into(), Address::ZERO, 1)
+                .unwrap(),
+            subgraph_chain: "test".into(),
+            result: Ok(IndexerResponse {
+                response_body: response_body.into(),
+                attestation: Some(attestation),
+                errors: Vec::new(),
+                indexed_block: None,
+            }),
+            response_time_ms: 250,
+            seconds_behind: 0,
+            blocks_behind: 0,
+            request: query.into(),
+        });
+        let error = reporter.report(request).unwrap_err();
+        assert!(error.to_string().starts_with("failed to send to topic"));
+        reporter
+            .kafka_producer
+            .purge(rdkafka::producer::PurgeConfig::default().queue());
+        reporter
+            .kafka_producer
+            .flush(Duration::from_secs(5))
+            .unwrap();
+        assert!(reporter.write_buf.is_empty());
+        reporter.report(self::request()).unwrap();
+        assert!(reporter.write_buf.is_empty());
+        reporter
+            .kafka_producer
+            .purge(rdkafka::producer::PurgeConfig::default().queue());
+    }
 }
