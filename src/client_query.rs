@@ -388,11 +388,7 @@ async fn run_indexer_queries(
     let _ = ctx.budgeter.feedback.send(total_fees_usd);
 
     for indexer_request in &indexer_requests {
-        let latest_block = match &indexer_request.result {
-            Ok(response) => response.indexed_block.as_ref().map(|b| b.number),
-            Err(IndexerError::Unavailable(UnavailableReason::MissingBlock(err))) => err.latest,
-            _ => None,
-        };
+        let latest_block = reported_latest_block(&indexer_request.result);
         ctx.indexing_perf.feedback(
             indexer_request.indexer,
             indexer_request.deployment,
@@ -651,6 +647,14 @@ fn blocks_behind(seconds_behind: u32, blocks_per_minute: u64) -> u64 {
     ((seconds_behind as f64 / 60.0) * blocks_per_minute as f64) as u64
 }
 
+fn reported_latest_block(result: &Result<IndexerResponse, IndexerError>) -> Option<BlockNumber> {
+    match result {
+        Ok(response) => response.indexed_block.as_ref().map(|block| block.number),
+        Err(IndexerError::Unavailable(UnavailableReason::MissingBlock(err))) => err.latest,
+        _ => None,
+    }
+}
+
 pub async fn handle_indexer_query(
     State(ctx): State<Context>,
     Extension(auth): Extension<AuthSettings>,
@@ -769,7 +773,7 @@ pub async fn handle_indexer_query(
         indexer_request.deployment,
         indexer_request.result.is_ok(),
         indexer_request.response_time_ms,
-        latest_block,
+        reported_latest_block(&indexer_request.result),
     );
 
     let _ = ctx.reporter.send(reports::ClientRequest {
@@ -998,6 +1002,42 @@ mod tests {
             assert_matches!(parse_text_response_body(res.body_mut()).await, Ok(res_body) => {
                 assert_eq!(res_body, api_key);
             });
+        }
+    }
+}
+
+#[cfg(test)]
+mod observed_progress_tests {
+    use super::*;
+    use crate::blocks::Block;
+
+    #[test]
+    fn feedback_progress_comes_only_from_the_indexer_response() {
+        let mut response = IndexerResponse {
+            response_body: String::new(),
+            attestation: None,
+            errors: Vec::new(),
+            indexed_block: None,
+        };
+        assert_eq!(reported_latest_block(&Ok(response.clone())), None);
+        response.indexed_block = Some(Block {
+            number: 90,
+            hash: Default::default(),
+            timestamp: 1,
+        });
+        assert_eq!(reported_latest_block(&Ok(response)), Some(90));
+        assert_eq!(reported_latest_block(&Err(IndexerError::Timeout)), None);
+        assert_eq!(
+            reported_latest_block(&Err(IndexerError::BadResponse("bad response".into()))),
+            None
+        );
+        for latest in [None, Some(80)] {
+            let error =
+                IndexerError::Unavailable(UnavailableReason::MissingBlock(MissingBlockError {
+                    missing: Some(100),
+                    latest,
+                }));
+            assert_eq!(reported_latest_block(&Err(error)), latest);
         }
     }
 }
