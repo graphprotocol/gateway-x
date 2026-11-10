@@ -107,13 +107,13 @@ impl Actor {
     fn handle_msgs(&mut self, msgs: &mut Vec<Feedback>) {
         for unlocked in &self.data.0 {
             let mut locked = unlocked.write();
-            for Feedback {
+            for &Feedback {
                 indexer,
                 deployment,
                 success,
                 latency_ms,
                 latest_block,
-            } in msgs.drain(..)
+            } in msgs.iter()
             {
                 let snapshot = locked.entry((indexer, deployment)).or_default();
                 snapshot.response.feedback(success, latency_ms);
@@ -124,7 +124,7 @@ impl Actor {
                 };
             }
         }
-        debug_assert!(msgs.is_empty());
+        msgs.clear();
     }
 
     fn handle_network(&mut self, network: &NetworkService) {
@@ -138,6 +138,47 @@ impl Actor {
                 if *latest_block >= snapshot.latest_block.unwrap_or(0) {
                     snapshot.latest_block = Some(*latest_block);
                 };
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod feedback_tests {
+    use super::*;
+
+    #[test]
+    fn completed_feedback_is_visible_through_either_buffer() {
+        let data = Box::leak(Box::new(DoubleBuffer::default()));
+        let (msgs, _rx) = mpsc::unbounded_channel();
+        let performance = IndexingPerformance { data, msgs };
+        let mut actor = Actor { data };
+        let indexer = thegraph_core::alloy::primitives::Address::ZERO.into();
+        let deployment = [0; 32].into();
+        let mut expected = indexer_selection::Performance::default();
+        for (success, latency_ms, latest_block) in [(true, 250, Some(100)), (false, 900, Some(90))]
+        {
+            expected.feedback(success, latency_ms);
+            let mut batch = vec![Feedback {
+                indexer,
+                deployment,
+                success,
+                latency_ms,
+                latest_block,
+            }];
+            actor.handle_msgs(&mut batch);
+            assert!(batch.is_empty());
+            for blocked in 0..2 {
+                let _guard = data.0[blocked].write();
+                let snapshot = performance.latest();
+                let snapshot = snapshot
+                    .get(&(indexer, deployment))
+                    .expect("feedback snapshot");
+                assert_eq!(snapshot.latest_block, Some(100));
+                let actual = snapshot.response.expected_performance();
+                let expected = expected.expected_performance();
+                assert_eq!(actual.latency_ms, expected.latency_ms);
+                assert_eq!(actual.success_rate, expected.success_rate);
             }
         }
     }
