@@ -33,7 +33,7 @@ use crate::{
     errors::{Error, IndexerError, IndexerErrors, MissingBlockError, UnavailableReason},
     indexer_client::{IndexerAuth, IndexerResponse},
     indexing_performance,
-    metrics::{METRICS, with_metric},
+    metrics::METRICS,
     middleware::RequestId,
     network::{DeploymentError, Indexing, IndexingId, ResolvedSubgraphInfo, SubgraphError},
     reports,
@@ -91,10 +91,7 @@ pub async fn handle_query(
         Ok(_) => METRICS.client_query.ok.inc(),
         Err(_) => METRICS.client_query.err.inc(),
     };
-    METRICS
-        .client_query
-        .duration
-        .observe(start_time.elapsed().as_secs_f64());
+    METRICS.client_query.observe_duration(start_time.elapsed());
 
     result.map(
         |IndexerResponse {
@@ -412,9 +409,10 @@ async fn run_indexer_queries(
         METRICS
             .indexer_query
             .check(&labels, &indexer_request.result);
-        with_metric(&METRICS.indexer_query.duration, &labels, |hist| {
-            hist.observe(indexer_request.response_time_ms as f64)
-        });
+        METRICS.indexer_query.observe_duration(
+            &labels,
+            Duration::from_millis(u64::from(indexer_request.response_time_ms)),
+        );
 
         tracing::info!(
             indexer = ?indexer_request.indexer,
@@ -744,17 +742,17 @@ pub async fn handle_indexer_query(
     METRICS
         .indexer_query
         .check(&labels, &indexer_request.result);
-    with_metric(&METRICS.indexer_query.duration, &labels, |hist| {
-        hist.observe(indexer_request.response_time_ms as f64)
-    });
+    METRICS.indexer_query.observe_duration(
+        &labels,
+        Duration::from_millis(u64::from(indexer_request.response_time_ms)),
+    );
     match &result {
         Ok(_) => METRICS.client_query.ok.inc(),
         Err(_) => METRICS.client_query.err.inc(),
     };
     METRICS
         .client_query
-        .duration
-        .observe(response_time_ms as f64);
+        .observe_duration(Duration::from_millis(u64::from(response_time_ms)));
 
     tracing::info!(
         indexer = ?indexer_request.indexer,

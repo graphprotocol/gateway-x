@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use lazy_static::lazy_static;
 use prometheus::{
     Gauge, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGaugeVec,
@@ -63,13 +65,17 @@ impl ResponseMetrics {
             .unwrap(),
             duration: register_histogram!(
                 &format!("{prefix}_duration"),
-                &format!("{description} duration"),
+                &format!("{description} duration in seconds"),
             )
             .unwrap(),
         };
         metrics.ok.inc();
         metrics.err.inc();
         metrics
+    }
+
+    pub fn observe_duration(&self, duration: Duration) {
+        self.duration.observe(duration.as_secs_f64());
     }
 }
 
@@ -97,7 +103,7 @@ impl ResponseMetricVecs {
             .unwrap(),
             duration: register_histogram_vec!(
                 &format!("{prefix}_duration"),
-                &format!("{description} duration"),
+                &format!("{description} duration in seconds"),
                 labels,
             )
             .unwrap(),
@@ -110,6 +116,12 @@ impl ResponseMetricVecs {
             Err(_) => with_metric(&self.err, label_values, |c| c.inc()),
         };
     }
+
+    pub fn observe_duration(&self, label_values: &[&str], duration: Duration) {
+        with_metric(&self.duration, label_values, |histogram| {
+            histogram.observe(duration.as_secs_f64())
+        });
+    }
 }
 
 pub fn with_metric<T, F, B>(metric_vec: &MetricVec<B>, label_values: &[&str], f: F) -> Option<T>
@@ -121,4 +133,34 @@ where
         .get_metric_with_label_values(label_values)
         .ok()
         .map(f)
+}
+
+#[cfg(test)]
+mod duration_tests {
+    use prometheus::core::Collector;
+
+    use super::*;
+
+    #[test]
+    fn query_histograms_record_seconds_in_default_buckets() {
+        let client = ResponseMetrics::new("test_client_seconds", "test client");
+        let indexer = ResponseMetricVecs::new("test_indexer_seconds", "test indexer", &["indexer"]);
+        client.observe_duration(Duration::from_millis(250));
+        indexer.observe_duration(&["test"], Duration::from_millis(250));
+        for histogram in [
+            client.duration,
+            indexer.duration.with_label_values(&["test"]),
+        ] {
+            assert_eq!(histogram.get_sample_count(), 1);
+            assert_eq!(histogram.get_sample_sum(), 0.25);
+            let metrics = histogram.collect();
+            let buckets = metrics[0].get_metric()[0].get_histogram().get_bucket();
+            for bucket in buckets {
+                assert_eq!(
+                    bucket.cumulative_count(),
+                    u64::from(bucket.upper_bound() >= 0.25)
+                );
+            }
+        }
+    }
 }
