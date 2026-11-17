@@ -20,6 +20,7 @@ mod receipts;
 mod reports;
 mod time;
 mod unattestable_errors;
+mod version;
 
 use std::{
     collections::HashSet,
@@ -132,6 +133,8 @@ async fn main() {
         kafka_consumer.clone(),
         topic_name("gateway_blocklist"),
     );
+    let version_info =
+        version::VersionInfo::new(&conf.min_indexer_version, &conf.min_graph_node_version);
     let mut network = network::service::spawn(
         http_client.clone(),
         network_subgraph_client,
@@ -243,6 +246,7 @@ async fn main() {
         .route("/", routing::get(|| async { "Ready to roll!" }))
         // This path is required by NGINX ingress controller
         .route("/ready", routing::get(|| async { "Ready" }))
+        .route("/version", version::route(version_info))
         .route(
             "/blocklist",
             routing::get(move || async move { axum::Json(blocklist.borrow().clone()) }),
