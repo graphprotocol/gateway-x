@@ -39,14 +39,15 @@ version, at `GET /version`:
 {
   "version": "27.7.1",
   "indexer_requirements": {
-    "indexer_service": ">=1.0.0",
-    "graph_node": ">=0.35.0"
+    "min_indexer_service_version": "1.0.0",
+    "min_graph_node_version": "0.35.0"
   }
 }
 ```
 
-An indexer whose graph-node doesn't report its version is not excluded by the graph-node
-requirement.
+Versions are compared by semver precedence, so a prerelease of a later version meets a minimum
+(`1.3.0-rc.1` meets `1.2.3`). An indexer whose graph-node doesn't report its version is not
+excluded by the graph-node requirement.
 
 The gateway may be configured to block public Proofs Of Indexing (POIs) that have been associated
 with bad query responses. In this case deployments with such POIs require an additional step in

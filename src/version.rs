@@ -5,7 +5,7 @@
 //! reading the gateway's configuration.
 
 use axum::{Json, routing::MethodRouter};
-use semver::{Comparator, Op, Version, VersionReq};
+use semver::Version;
 use serde::Serialize;
 
 /// The `/version` response body.
@@ -18,13 +18,18 @@ pub struct VersionInfo {
 }
 
 /// Version requirements an indexer's software must meet to receive queries.
+///
+/// Each is the lowest version that receives queries. Versions are compared by semver precedence,
+/// as the gateway's version filter compares them, so a prerelease of a later version also meets
+/// the minimum: `1.3.0-rc.1` meets `1.2.3`. A semver range such as `>=1.2.3` would not say this,
+/// since ranges exclude prereleases they don't name.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct IndexerRequirements {
-    /// Requirement on the version indexer-service reports at its `/version` endpoint.
-    pub indexer_service: VersionReq,
-    /// Requirement on the version graph-node reports through indexer-service's `/status`
-    /// endpoint. An indexer whose graph-node doesn't report a version is not excluded.
-    pub graph_node: VersionReq,
+    /// Minimum version indexer-service reports at its `/version` endpoint.
+    pub min_indexer_service_version: Version,
+    /// Minimum version graph-node reports through indexer-service's `/status` endpoint. An
+    /// indexer whose graph-node doesn't report a version is not excluded.
+    pub min_graph_node_version: Version,
 }
 
 impl VersionInfo {
@@ -35,8 +40,8 @@ impl VersionInfo {
                 .parse()
                 .expect("the crate version is valid semver"),
             indexer_requirements: IndexerRequirements {
-                indexer_service: at_least(min_indexer_service_version),
-                graph_node: at_least(min_graph_node_version),
+                min_indexer_service_version: min_indexer_service_version.clone(),
+                min_graph_node_version: min_graph_node_version.clone(),
             },
         }
     }
@@ -45,19 +50,6 @@ impl VersionInfo {
 /// A route that answers `GET` with `info` as JSON.
 pub fn route(info: VersionInfo) -> MethodRouter {
     axum::routing::get(move || std::future::ready(Json(info.clone())))
-}
-
-/// The requirement `>=minimum`, which matches the gateway's `version < minimum` exclusion.
-fn at_least(minimum: &Version) -> VersionReq {
-    VersionReq {
-        comparators: vec![Comparator {
-            op: Op::GreaterEq,
-            major: minimum.major,
-            minor: Some(minimum.minor),
-            patch: Some(minimum.patch),
-            pre: minimum.pre.clone(),
-        }],
-    }
 }
 
 #[cfg(test)]
@@ -87,25 +79,39 @@ mod tests {
             json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 "indexer_requirements": {
-                    "indexer_service": ">=1.0.0-rc.2",
-                    "graph_node": ">=0.35.1",
+                    "min_indexer_service_version": "1.0.0-rc.2",
+                    "min_graph_node_version": "0.35.1",
                 },
             })
         );
     }
 
     #[test]
-    fn requirement_admits_exactly_the_versions_the_filter_admits() {
+    fn served_minimum_admits_exactly_the_versions_the_filter_admits() {
         let minimum = version("1.2.3");
-        let requirement = at_least(&minimum);
+        let info = VersionInfo::new(&minimum, &minimum);
+        let served = serde_json::to_value(&info).unwrap();
 
-        for candidate in ["1.2.2", "1.2.3", "1.2.4", "1.3.0", "2.0.0", "0.9.9"] {
-            let candidate = version(candidate);
-            assert_eq!(
-                requirement.matches(&candidate),
-                candidate >= minimum,
-                "{candidate}"
-            );
+        for field in ["min_indexer_service_version", "min_graph_node_version"] {
+            let served = version(served["indexer_requirements"][field].as_str().unwrap());
+            for candidate in [
+                "1.2.2",
+                "1.2.3",
+                "1.2.4",
+                "1.3.0",
+                "2.0.0",
+                "0.9.9",
+                "1.2.3-rc.1",
+                "1.3.0-rc.1",
+            ] {
+                let candidate = version(candidate);
+                // Compared as clients are told to compare: by semver precedence.
+                assert_eq!(
+                    candidate >= served,
+                    candidate >= minimum,
+                    "{field} {candidate}"
+                );
+            }
         }
     }
 
