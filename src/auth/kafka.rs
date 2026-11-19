@@ -164,8 +164,13 @@ fn handle_event(
             .collect(),
         domains: event.domains,
     };
-    keys.insert(event.id, key.key.clone());
+    // Events have no source revision: a stale event published after rotation can
+    // restore the old secret. Preventing that requires producer ordering or versioning.
+    let previous_key = keys.insert(event.id, key.key.clone());
     tx.send_modify(move |map| {
+        if let Some(previous_key) = previous_key {
+            map.remove(&previous_key);
+        }
         map.insert(key.key.clone(), key);
     });
 }
@@ -262,4 +267,93 @@ enum EventType {
     /// Bootstrap event from the gateway to initialize its cache of api keys
     #[prost(Name = "BOOTSTRAP", tag = "13")]
     Bootstrap = 13,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::AuthContext;
+
+    const OLD_KEY: &str = "11111111111111111111111111111111";
+    const NEW_KEY: &str = "22222222222222222222222222222222";
+    const OTHER_KEY: &str = "33333333333333333333333333333333";
+
+    fn event(id: i32, key: &str, event_type: EventType) -> ApiKeyEvent {
+        ApiKeyEvent {
+            id,
+            key: key.to_owned(),
+            event_type: event_type as i32,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn replacing_key_revokes_previous_value() {
+        // Replay/bootstrap and ordinary updates must also replace a changed secret.
+        for event_type in [
+            EventType::ApiKeyRotated,
+            EventType::Bootstrap,
+            EventType::QueriesReceived,
+        ] {
+            let mut keys = HashMap::new();
+            let (tx, rx) = watch::channel(HashMap::new());
+            let auth = AuthContext {
+                payment_required: true,
+                api_keys: rx,
+                special_api_keys: Default::default(),
+            };
+            handle_event(&mut keys, &tx, event(1, OLD_KEY, EventType::ApiKeyCreated));
+            handle_event(
+                &mut keys,
+                &tx,
+                event(2, OTHER_KEY, EventType::ApiKeyCreated),
+            );
+            assert!(auth.check(OLD_KEY, "").is_ok());
+
+            handle_event(&mut keys, &tx, event(1, NEW_KEY, event_type));
+            assert!(auth.check(OLD_KEY, "").is_err(), "{event_type:?}");
+            assert!(auth.check(NEW_KEY, "").is_ok(), "{event_type:?}");
+            assert!(auth.check(OTHER_KEY, "").is_ok());
+            assert_eq!(keys.get(&1).map(String::as_str), Some(NEW_KEY));
+            assert_eq!(auth.api_keys.borrow().len(), 2);
+
+            // Replayed events must preserve the replacement, without reviving the old key.
+            handle_event(&mut keys, &tx, event(1, NEW_KEY, event_type));
+            assert!(auth.check(NEW_KEY, "").is_ok());
+            assert!(auth.check(OLD_KEY, "").is_err());
+
+            handle_event(&mut keys, &tx, event(1, NEW_KEY, EventType::ApiKeyDeleted));
+            assert!(auth.check(OLD_KEY, "").is_err());
+            assert!(auth.check(NEW_KEY, "").is_err());
+            assert!(auth.check(OTHER_KEY, "").is_ok());
+            assert!(!keys.contains_key(&1));
+            assert_eq!(auth.api_keys.borrow().len(), 1);
+        }
+    }
+
+    #[test]
+    fn same_key_updates_authorization_settings() {
+        let mut keys = HashMap::new();
+        let (tx, rx) = watch::channel(HashMap::new());
+        let auth = AuthContext {
+            payment_required: true,
+            api_keys: rx,
+            special_api_keys: Default::default(),
+        };
+        handle_event(&mut keys, &tx, event(1, OLD_KEY, EventType::ApiKeyCreated));
+        assert!(auth.check(OLD_KEY, "").is_ok());
+
+        let mut update = event(1, OLD_KEY, EventType::ApiKeyAuthorizedDomainAdded);
+        update.domains = vec!["example.com".to_owned()];
+        handle_event(&mut keys, &tx, update);
+        assert!(auth.check(OLD_KEY, "example.com").is_ok());
+        assert!(auth.check(OLD_KEY, "other.com").is_err());
+
+        let mut update = event(1, OLD_KEY, EventType::QueriesReceived);
+        update.query_status = QueryStatus::ServiceShutoff as i32;
+        handle_event(&mut keys, &tx, update);
+        assert!(auth.check(OLD_KEY, "example.com").is_err());
+        assert_eq!(auth.api_keys.borrow().len(), 1);
+        assert_eq!(keys.get(&1).map(String::as_str), Some(OLD_KEY));
+    }
 }
