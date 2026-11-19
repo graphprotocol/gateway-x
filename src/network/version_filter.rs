@@ -37,16 +37,14 @@ impl VersionFilter {
             ));
         }
 
-        // TODO: After more graph nodes support reporting their version, we should assume they are
-        // on the minimum version if we can't get the version.
-        match self.fetch_graph_node_version(url).await {
-            Ok(version) if version < self.min_versions.graph_node => {
-                return Err(UnavailableReason::NotSupported(
-                    "graph-node version below minimum".to_string(),
-                ));
-            }
-            _ => (),
-        };
+        // An indexer whose graph-node doesn't report its version can't be shown to meet the
+        // minimum, so it doesn't receive queries.
+        let graph_node_version = self.fetch_graph_node_version(url).await?;
+        if graph_node_version < self.min_versions.graph_node {
+            return Err(UnavailableReason::NotSupported(
+                "graph-node version below minimum".to_string(),
+            ));
+        }
 
         Ok(())
     }
@@ -116,5 +114,89 @@ impl VersionFilter {
             .insert(url.to_string(), version.clone());
 
         Ok(version)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use assert_matches::assert_matches;
+    use axum::{Json, Router, routing};
+    use serde_json::{Value, json};
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    /// Serves an indexer-service that reports `indexer_service` at `/version` and answers `/status`
+    /// with `status`, returning its base URL.
+    async fn indexer(indexer_service: &'static str, status: Value) -> Url {
+        let router = Router::new()
+            .route(
+                "/version",
+                routing::get(move || async move { Json(json!({ "version": indexer_service })) }),
+            )
+            .route(
+                "/status",
+                routing::post(move || async move { Json(status) }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        format!("http://{addr}/").parse().unwrap()
+    }
+
+    fn graph_node_reports(version: &str) -> Value {
+        json!({ "data": { "version": { "version": version } } })
+    }
+
+    fn filter() -> VersionFilter {
+        VersionFilter::new(
+            reqwest::Client::new(),
+            MinimumVersionRequirements {
+                indexer_service: "1.0.0".parse().unwrap(),
+                graph_node: "0.35.0".parse().unwrap(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn accepts_indexer_meeting_both_minimums() {
+        let url = indexer("1.0.0", graph_node_reports("0.35.0")).await;
+
+        assert_matches!(filter().check(&url).await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn rejects_indexer_whose_graph_node_does_not_report_its_version() {
+        let url = indexer(
+            "1.0.0",
+            json!({ "errors": [{ "message": "Type `Query` has no field `version`" }] }),
+        )
+        .await;
+
+        assert_matches!(
+            filter().check(&url).await,
+            Err(UnavailableReason::NoStatus(reason)) if reason.contains("graph-node version")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_indexer_whose_graph_node_is_below_minimum() {
+        let url = indexer("1.0.0", graph_node_reports("0.34.9")).await;
+
+        assert_matches!(
+            filter().check(&url).await,
+            Err(UnavailableReason::NotSupported(reason)) if reason == "graph-node version below minimum"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_indexer_service_below_minimum() {
+        let url = indexer("0.9.0", graph_node_reports("0.35.0")).await;
+
+        assert_matches!(
+            filter().check(&url).await,
+            Err(UnavailableReason::NotSupported(reason))
+                if reason == "indexer-service version below minimum"
+        );
     }
 }

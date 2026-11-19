@@ -44,7 +44,8 @@ pub struct Config {
     pub kafka: KafkaConfig,
     /// Format log output as JSON
     pub log_json: bool,
-    /// Minimum graph-node version that will receive queries
+    /// Minimum graph-node version that will receive queries. An indexer whose graph-node does not
+    /// report its version receives no queries.
     #[serde_as(as = "DisplayFromStr")]
     pub min_graph_node_version: Version,
     /// Minimum indexer-service version that will receive queries
