@@ -31,6 +31,24 @@ After the subgraph data is collected and organized, the gateway requests more in
 active indexer via the indexer-service. This includes software version information and, for each
 allocation, the indexing status (progress on chain indexed by subgraph deployment) and cost models.
 
+Indexers running an indexer-service older than `min_indexer_version`, or a graph-node older than
+`min_graph_node_version`, are not sent queries. The gateway serves these requirements, with its own
+version, at `GET /version`:
+
+```json
+{
+  "version": "27.7.1",
+  "indexer_requirements": {
+    "min_indexer_service_version": "1.0.0",
+    "min_graph_node_version": "0.35.0"
+  }
+}
+```
+
+Versions are compared by semver precedence, so a prerelease of a later version meets a minimum
+(`1.3.0-rc.1` meets `1.2.3`). An indexer whose graph-node doesn't report its version is not
+excluded by the graph-node requirement.
+
 The gateway may be configured to block public Proofs Of Indexing (POIs) that have been associated
 with bad query responses. In this case deployments with such POIs require an additional step in
 discovery where indexers are required to submit their public POI. If the indexer's POI has been
