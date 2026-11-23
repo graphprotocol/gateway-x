@@ -28,7 +28,7 @@ use super::{
     poi_filter::PoiFilter,
     pre_processing,
     snapshot::{self, Indexing, IndexingId, NetworkTopologySnapshot},
-    subgraph_client::Client as SubgraphClient,
+    subgraph_client::{Client as SubgraphClient, FetchResult},
     subgraph_processing::{self, DeploymentInfo, SubgraphInfo},
     version_filter::{MinimumVersionRequirements, VersionFilter},
 };
@@ -81,7 +81,7 @@ impl NetworkService {
     /// Wait for the network topology information to be available.
     pub async fn wait_until_ready(&mut self) {
         self.network
-            .wait_for(|n| !n.subgraphs.is_empty())
+            .wait_for(|n| !n.subgraphs.is_empty() || !n.deployments.is_empty())
             .await
             .unwrap();
     }
@@ -254,7 +254,8 @@ fn spawn_updater_task(
 ///   2. Validate and convert the fetched info into the internal representation.
 ///   3. Merge unpublished deployments into the deployments map.
 ///
-/// If the fetch fails or the response is empty, an error is returned.
+/// If the fetch fails or both collections are empty, an error is returned.
+/// An unpublished-only dataset is valid, even without any published subgraphs.
 ///
 /// Invalid info is filtered out before converting into the internal representation.
 pub async fn fetch_and_preprocess_subgraph_info(
@@ -262,7 +263,16 @@ pub async fn fetch_and_preprocess_subgraph_info(
 ) -> anyhow::Result<PreprocessedNetworkInfo> {
     // Fetch the subgraphs and unpublished deployments from the graph network subgraph
     let data = client.fetch().await?;
-    anyhow::ensure!(!data.subgraphs.is_empty(), "empty subgraph response");
+    preprocess_subgraph_info(data)
+}
+
+fn preprocess_subgraph_info(data: FetchResult) -> anyhow::Result<PreprocessedNetworkInfo> {
+    // Keep the previous topology on entirely empty responses, as on fetch failure.
+    // Published subgraphs are not a prerequisite for discovering development deployments.
+    anyhow::ensure!(
+        !data.subgraphs.is_empty() || !data.unpublished_deployments.is_empty(),
+        "empty subgraph response"
+    );
 
     // Pre-process (validate and convert) the fetched subgraphs information
     let mut indexers = pre_processing::into_internal_indexers_raw_info(data.subgraphs.iter());
@@ -326,4 +336,139 @@ pub struct PreprocessedNetworkInfo {
     subgraphs: HashMap<SubgraphId, Result<SubgraphInfo, SubgraphError>>,
     deployments: HashMap<DeploymentId, Result<DeploymentInfo, DeploymentError>>,
     indexers: HashMap<IndexerId, IndexerRawInfo>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        super::subgraph_client::types::{
+            Allocation, Indexer, Manifest, Subgraph, SubgraphDeployment, SubgraphVersion,
+        },
+        *,
+    };
+
+    fn deployment(seed: u8) -> SubgraphDeployment {
+        SubgraphDeployment {
+            id: [seed; 32].into(),
+            manifest: Some(Manifest {
+                network: Some("mainnet".into()),
+                start_block: 123,
+            }),
+            allocations: vec![Allocation {
+                id: Address::from([seed; 20]).into(),
+                allocated_tokens: 0,
+                indexer: Indexer {
+                    id: Address::from([1; 20]).into(),
+                    url: Some("https://indexer.example/".into()),
+                    staked_tokens: 100,
+                },
+            }],
+        }
+    }
+
+    fn published(deployment: SubgraphDeployment) -> Subgraph {
+        Subgraph {
+            id: [3; 32].into(),
+            versions: vec![SubgraphVersion {
+                _version: 1,
+                subgraph_deployment: deployment,
+            }],
+        }
+    }
+
+    #[test]
+    fn discovers_unpublished_only_with_zero_token_allocation() {
+        let deployment = deployment(1);
+        let id = deployment.id;
+        let indexer = deployment.allocations[0].indexer.id;
+        let info = preprocess_subgraph_info(FetchResult {
+            subgraphs: vec![],
+            unpublished_deployments: vec![deployment],
+        })
+        .unwrap();
+
+        assert!(info.subgraphs.is_empty());
+        let found = info.deployments[&id].as_ref().unwrap();
+        assert!(found.subgraphs.is_empty());
+        assert_eq!(found.manifest_network, "mainnet");
+        assert_eq!(found.manifest_start_block, 123);
+        assert_eq!(found.allocations[0].indexer, indexer);
+        assert!(info.indexers[&indexer].indexings.contains_key(&id));
+    }
+
+    #[test]
+    fn merges_mixed_discovery_and_accepts_refresh_without_published_entries() {
+        let old = deployment(1);
+        let new = deployment(2);
+        let indexer = old.allocations[0].indexer.id;
+        let mixed = preprocess_subgraph_info(FetchResult {
+            subgraphs: vec![published(old.clone())],
+            unpublished_deployments: vec![new.clone()],
+        })
+        .unwrap();
+        assert_eq!(mixed.subgraphs.len(), 1);
+        assert_eq!(mixed.deployments.len(), 2);
+        assert_eq!(mixed.indexers[&indexer].indexings.len(), 2);
+
+        let refreshed = preprocess_subgraph_info(FetchResult {
+            subgraphs: vec![],
+            unpublished_deployments: vec![new.clone()],
+        })
+        .unwrap();
+        assert!(refreshed.subgraphs.is_empty());
+        assert!(!refreshed.deployments.contains_key(&old.id));
+        assert!(refreshed.deployments.contains_key(&new.id));
+        assert_eq!(refreshed.indexers[&indexer].indexings.len(), 1);
+    }
+
+    #[test]
+    fn keeps_published_only_discovery_working() {
+        let info = preprocess_subgraph_info(FetchResult {
+            subgraphs: vec![published(deployment(1))],
+            unpublished_deployments: vec![],
+        })
+        .unwrap();
+        assert_eq!(info.subgraphs.len(), 1);
+        assert_eq!(info.deployments.len(), 1);
+        assert_eq!(info.indexers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn readiness_waits_for_topology_and_accepts_unpublished_deployments() {
+        let (tx, network) = watch::channel(NetworkTopologySnapshot::default());
+        let mut service = NetworkService { network };
+        let mut ready = tokio_test::task::spawn(service.wait_until_ready());
+        tokio_test::assert_pending!(ready.poll());
+
+        let id: DeploymentId = [1; 32].into();
+        tx.send(NetworkTopologySnapshot {
+            deployments: HashMap::from([(
+                id,
+                Ok(snapshot::Deployment {
+                    chain: "mainnet".into(),
+                    start_block: 123,
+                    subgraphs: Default::default(),
+                    indexings: Default::default(),
+                }),
+            )]),
+            ..Default::default()
+        })
+        .unwrap();
+        tokio_test::assert_ready!(ready.poll());
+        drop(ready);
+
+        let resolved = service.resolve_with_deployment_id(&id).unwrap().unwrap();
+        assert_eq!(resolved.chain, "mainnet");
+        assert_eq!(resolved.versions, vec![id]);
+        assert!(resolved.subgraphs.is_empty());
+    }
+
+    #[test]
+    fn entirely_empty_response_remains_an_error() {
+        let result = preprocess_subgraph_info(FetchResult {
+            subgraphs: vec![],
+            unpublished_deployments: vec![],
+        });
+        assert_eq!(result.err().unwrap().to_string(), "empty subgraph response");
+    }
 }
