@@ -161,3 +161,15 @@ mod duration_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod counter_tests {
+    use super::*;
+
+    #[test]
+    fn response_metrics_counters_start_at_zero() {
+        let metrics = ResponseMetrics::new("test_counter_initialization", "test counters");
+        assert_eq!(metrics.ok.get(), 0);
+        assert_eq!(metrics.err.get(), 0);
+    }
+}
