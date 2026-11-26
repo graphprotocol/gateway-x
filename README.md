@@ -46,8 +46,8 @@ version, at `GET /version`:
 ```
 
 Versions are compared by semver precedence, so a prerelease of a later version meets a minimum
-(`1.3.0-rc.1` meets `1.2.3`). An indexer whose graph-node doesn't report its version is not
-excluded by the graph-node requirement.
+(`1.3.0-rc.1` meets `1.2.3`). An indexer whose graph-node doesn't report its version receives
+no queries.
 
 The gateway may be configured to block public Proofs Of Indexing (POIs) that have been associated
 with bad query responses. In this case deployments with such POIs require an additional step in

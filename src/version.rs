@@ -28,7 +28,7 @@ pub struct IndexerRequirements {
     /// Minimum version indexer-service reports at its `/version` endpoint.
     pub min_indexer_service_version: Version,
     /// Minimum version graph-node reports through indexer-service's `/status` endpoint. An
-    /// indexer whose graph-node doesn't report a version is not excluded.
+    /// indexer whose graph-node doesn't report a version receives no queries.
     pub min_graph_node_version: Version,
 }
 
